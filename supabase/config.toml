@@ -1,0 +1,8 @@
+[functions.spectacles-gateway]
+verify_jwt = true
+
+[functions.memory-write]
+verify_jwt = true
+
+[functions.boardroom]
+verify_jwt = false
