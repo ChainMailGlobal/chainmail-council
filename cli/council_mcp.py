@@ -35,13 +35,18 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 
-BOARDROOM_URL     = os.environ.get("BOARDROOM_URL",
+BOARDROOM_URL       = os.environ.get("BOARDROOM_URL",
     "https://emyiiapbjrijawaejcxd.supabase.co/functions/v1/boardroom")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
-OPENAI_API_KEY    = os.environ.get("OPENAI_API_KEY", "")
-AUDIT_LOG         = Path.home() / ".chainmail" / "council_audit.jsonl"
-BKEY_CRED_FILE    = Path.home() / ".chainmail" / "bkey_credential.json"
-SESSION_ID        = "jetbrains-" + str(uuid.uuid4())[:8]
+SUPABASE_ANON_KEY   = os.environ.get("SUPABASE_ANON_KEY", "")
+OPENAI_API_KEY      = os.environ.get("OPENAI_API_KEY", "")
+NEBIUS_API_KEY      = os.environ.get("NEBIUS_API_KEY", "")
+MMCP_BASE           = os.environ.get("MMCP_BASE", "https://api.chainmail.global/mmcp")
+MMCP_UI_TOKEN       = os.environ.get("MMCP_UI_TOKEN", "")
+TOKEN_FACTORY_BASE  = "https://api.tokenfactory.nebius.com/v1"
+HERMES_MODEL        = "NousResearch/Hermes-4-405B"
+AUDIT_LOG           = Path.home() / ".chainmail" / "council_audit.jsonl"
+BKEY_CRED_FILE      = Path.home() / ".chainmail" / "bkey_credential.json"
+SESSION_ID          = "jetbrains-" + str(uuid.uuid4())[:8]
 
 # Files that must never be sent to any external API
 _SECRET_PATTERNS = re.compile(
@@ -68,6 +73,108 @@ def call_boardroom(task: str, context: str | None = None) -> dict:
     )
     resp.raise_for_status()
     return resp.json()
+
+# ---------------------------------------------------------------------------
+# Hermes — NousResearch Hermes-4-405B via Nebius Token Factory
+# Structures and enriches tasks before council deliberation
+# ---------------------------------------------------------------------------
+
+def call_hermes(task: str, context: str = "") -> dict:
+    """
+    Hermes-4-405B structures the task: extracts intent, risk surface,
+    affected components, and recommended council composition.
+    Returns structured brief that gets passed to council as context.
+    """
+    if not NEBIUS_API_KEY:
+        return {"structured_task": task, "hermes": False}
+
+    system = (
+        "You are Hermes, ChainMail's agentic structuring engine. "
+        "Before the council deliberates, you analyze the task and produce a structured brief.\n\n"
+        "Respond ONLY with valid JSON:\n"
+        "{\n"
+        '  "structured_task": "Refined one-sentence task description",\n'
+        '  "intent": "What is being changed and why",\n'
+        '  "risk_surface": "What could break or go wrong",\n'
+        '  "affected_components": ["list", "of", "affected", "areas"],\n'
+        '  "recommended_agents": ["cto", "cfo"],\n'
+        '  "key_questions": ["Question the council should answer"]\n'
+        "}"
+    )
+    user = f"Task: {task}\n\nContext:\n{context[:2000]}" if context else f"Task: {task}"
+
+    try:
+        resp = requests.post(
+            f"{TOKEN_FACTORY_BASE}/chat/completions",
+            headers={"Authorization": f"Bearer {NEBIUS_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": HERMES_MODEL,
+                  "messages": [{"role": "system", "content": system},
+                                {"role": "user",   "content": user}],
+                  "max_tokens": 512, "temperature": 0.2},
+            timeout=45,
+        )
+        resp.raise_for_status()
+        raw = resp.json()["choices"][0]["message"]["content"]
+        m = __import__("re").search(r"\{[\s\S]*\}", raw)
+        if m:
+            data = json.loads(m.group(0))
+            data["hermes"] = True
+            data["model"]  = HERMES_MODEL
+            return data
+    except Exception as e:
+        pass
+    return {"structured_task": task, "hermes": False, "error": "Hermes unavailable"}
+
+
+# ---------------------------------------------------------------------------
+# MMCP Bubble Memory — retrieve context from sovereign memory on VM
+# ---------------------------------------------------------------------------
+
+def retrieve_mmcp(query: str, limit: int = 5) -> list[dict]:
+    """
+    Semantic search through MMCP Bubble Memory (pgvector on H100 VM).
+    Pulls relevant past decisions, code changes, and context by meaning.
+    Falls back to local audit log if VM unreachable.
+    """
+    headers = {"Content-Type": "application/json"}
+    if MMCP_UI_TOKEN:
+        headers["Authorization"] = f"Bearer {MMCP_UI_TOKEN}"
+
+    # Try MMCP search endpoint
+    for endpoint in [
+        f"{MMCP_BASE}/bubbles/search",
+        f"{MMCP_BASE}/search",
+    ]:
+        try:
+            resp = requests.post(
+                endpoint,
+                headers=headers,
+                json={"query": query, "session_id": SESSION_ID, "limit": limit},
+                timeout=15,
+            )
+            if resp.ok:
+                data = resp.json()
+                results = data.get("results") or data.get("data") or []
+                if results:
+                    return [{"source": "mmcp_vm", **r} for r in results[:limit]]
+        except Exception:
+            pass
+
+    # Fallback: local audit log semantic-ish match
+    results = []
+    for entry in read_audit(50):
+        task = entry.get("task", "")
+        if any(w.lower() in task.lower() for w in query.split()[:4]):
+            results.append({
+                "source":    "local_audit",
+                "content":   f"{entry.get('decision','?').upper()}: {task}",
+                "timestamp": entry.get("timestamp", "")[:10],
+                "agents":    entry.get("agents", []),
+                "audit_id":  entry.get("audit_id", ""),
+            })
+    return results[:limit]
+
 
 # ---------------------------------------------------------------------------
 # Repo context builder — safe, token-budgeted, secret-filtered
@@ -293,16 +400,46 @@ def read_audit(last: int = 10) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def tool_convene_council(task: str, context: str | None = None) -> dict:
-    result = call_boardroom(task, context=context)
+    # 1. Retrieve relevant memories from MMCP — JetBrains walks in briefed
+    memories = retrieve_mmcp(task, limit=4)
+    memory_block = ""
+    if memories:
+        memory_block = "\n\n## Relevant Memory (MMCP Bubble Memory — sovereign VM)\n"
+        for m in memories:
+            src = m.get("source", "mmcp")
+            content = m.get("content", m.get("reasoning", ""))[:300]
+            ts = m.get("timestamp", m.get("created_at", ""))[:10]
+            memory_block += f"- [{ts}] ({src}) {content}\n"
+
+    # 2. Hermes structures the task before council sees it
+    hermes_brief = call_hermes(task, context=(context or "") + memory_block)
+    hermes_block = ""
+    if hermes_brief.get("hermes"):
+        hermes_block = (
+            f"\n\n## Hermes Structured Brief (NousResearch Hermes-4-405B)\n"
+            f"Intent: {hermes_brief.get('intent','')}\n"
+            f"Risk surface: {hermes_brief.get('risk_surface','')}\n"
+            f"Key questions: {'; '.join(hermes_brief.get('key_questions',[]))}\n"
+        )
+
+    # 3. Council deliberates with enriched context
+    enriched_task = hermes_brief.get("structured_task", task)
+    enriched_context = (context or "") + memory_block + hermes_block
+
+    result = call_boardroom(enriched_task, context=enriched_context)
     write_audit(result, task)
+
     return {
-        "decision":     result.get("consensus", {}).get("decision"),
-        "summary":      result.get("consensus", {}).get("summary"),
-        "conditions":   result.get("consensus", {}).get("conditions"),
-        "agents":       result.get("agents_selected", []),
-        "vote_tally":   result.get("consensus", {}).get("vote_tally"),
-        "audit_id":     result.get("audit_id"),
-        "mmcp_written": result.get("memory_written", False),
+        "decision":      result.get("consensus", {}).get("decision"),
+        "summary":       result.get("consensus", {}).get("summary"),
+        "conditions":    result.get("consensus", {}).get("conditions"),
+        "agents":        result.get("agents_selected", []),
+        "vote_tally":    result.get("consensus", {}).get("vote_tally"),
+        "audit_id":      result.get("audit_id"),
+        "mmcp_written":  result.get("memory_written", False),
+        "hermes_used":   hermes_brief.get("hermes", False),
+        "memories_used": len(memories),
+        "hermes_brief":  {k: v for k, v in hermes_brief.items() if k not in ("hermes","model","error")},
         "deliberations": [
             {"agent": v["agent"], "recommendation": v["recommendation"],
              "confidence": v["confidence"], "reasoning": v["reasoning"]}
@@ -481,6 +618,30 @@ def tool_verify_ledger() -> dict:
     }
 
 
+def tool_recall(query: str) -> dict:
+    """
+    JetBrains personalization — show what the system remembers about this project.
+    Pulls from MMCP Bubble Memory (sovereign VM) + local audit trail.
+    This is what makes JetBrains feel like it knows you.
+    """
+    memories = retrieve_mmcp(query, limit=6)
+    local    = [e for e in read_audit(20)
+                if any(w.lower() in e.get("task","").lower() for w in query.split()[:3])]
+    return {
+        "query":          query,
+        "mmcp_memories":  memories,
+        "local_decisions": [
+            {"date": e.get("timestamp","")[:10],
+             "decision": e.get("decision",""),
+             "task": e.get("task",""),
+             "agents": e.get("agents",[])}
+            for e in local[-5:]
+        ],
+        "total_recalled": len(memories) + len(local),
+        "source":         "MMCP Bubble Memory (sovereign H100 VM) + local audit ledger",
+    }
+
+
 def tool_audit_log(last: int = 10) -> list[dict]:
     return read_audit(last)
 
@@ -587,6 +748,21 @@ TOOLS = [
         },
     },
     {
+        "name": "recall",
+        "description": (
+            "Retrieve what ChainMail remembers about this project from MMCP Bubble Memory "
+            "(sovereign pgvector on the H100 VM) + local audit trail. "
+            "This is JetBrains personalization — Codex walks in briefed, not cold."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to recall (e.g. 'rate limiting', 'gateway', 'past decisions')"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "verify_ledger",
         "description": (
             "Verify the cryptographic integrity of the audit ledger (ledgerbility). "
@@ -632,6 +808,8 @@ def handle_request(req: dict) -> dict | None:
                 data = tool_bkey_status()
             elif name == "retrieve_memory":
                 data = tool_retrieve_memory(args["query"], args.get("limit", 5))
+            elif name == "recall":
+                data = tool_recall(args["query"])
             elif name == "hermes_agent":
                 data = tool_hermes_agent(args["task"], args.get("tools"), args.get("context"))
             elif name == "verify_ledger":
